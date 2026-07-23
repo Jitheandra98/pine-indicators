@@ -1,0 +1,200 @@
+//@version=6
+indicator("Quantum Flow Lean", overlay=true, max_labels_count=200, max_lines_count=100, max_boxes_count=100)
+
+// One signal: HTF bias → liquidity sweep → zone touch → displacement entry → fixed ATR R:R.
+// 10 inputs. No HP scoring, no simulated WR, no magnets, no Bayesian theatre.
+
+// ── Inputs ────────────────────────────────────────────────────────────────
+i_biasTF      = input.timeframe("60", "HTF for bias",            group="Bias")
+i_biasEmaLen  = input.int(20,         "HTF EMA length",          group="Bias")
+i_swingLen    = input.int(15,         "Swing pivot length",      group="Structure")
+i_maxOB       = input.int(5,          "Max OBs kept",            group="Zones")
+i_fvgMinATR   = input.float(0.3,      "FVG min size (ATR)",      group="Zones", step=0.05)
+i_maxFVG      = input.int(6,          "Max FVGs kept",           group="Zones")
+i_sweepTolATR = input.float(0.10,     "Sweep tolerance (ATR)",   group="Sweep", step=0.05)
+i_requireSwp  = input.bool(true,      "Require PDH/PDL sweep",   group="Signal")
+i_sweepWindow = input.int(5,          "Sweep valid window (bars)", group="Signal")
+i_displMult   = input.float(1.3,      "Displacement body × avg", group="Signal", step=0.1)
+i_cooldown    = input.int(6,          "Cooldown bars",           group="Signal")
+i_slATR       = input.float(1.5,      "SL (ATR)",                group="Risk", step=0.1)
+i_tpATR       = input.float(3.0,      "TP (ATR)",                group="Risk", step=0.1)
+
+// ── Core math ─────────────────────────────────────────────────────────────
+atr      = ta.atr(14)
+body     = math.abs(close - open)
+avgBody  = ta.sma(body, 10)
+isDispB  = close > open and body > avgBody * i_displMult
+isDispS  = close < open and body > avgBody * i_displMult
+sweepTol = atr * i_sweepTolATR
+
+// ── HTF bias (one EMA on one HTF) ─────────────────────────────────────────
+htfClose = request.security(syminfo.tickerid, i_biasTF, close,                     lookahead=barmerge.lookahead_off)
+htfEma   = request.security(syminfo.tickerid, i_biasTF, ta.ema(close, i_biasEmaLen), lookahead=barmerge.lookahead_off)
+biasBull = not na(htfClose) and not na(htfEma) and htfClose > htfEma
+biasBear = not na(htfClose) and not na(htfEma) and htfClose < htfEma
+
+// ── Structure (swing BOS only) ────────────────────────────────────────────
+swH = ta.pivothigh(high, i_swingLen, i_swingLen)
+swL = ta.pivotlow(low,  i_swingLen, i_swingLen)
+var float lastSwH = na
+var float lastSwL = na
+var int   structBias = 0
+if not na(swH)
+    lastSwH := swH
+if not na(swL)
+    lastSwL := swL
+brokeBull = not na(lastSwH) and close > lastSwH and structBias != 1
+brokeBear = not na(lastSwL) and close < lastSwL and structBias != -1
+if brokeBull
+    structBias := 1
+if brokeBear
+    structBias := -1
+
+// ── Order Blocks: last opposite candle before a BOS ───────────────────────
+type OB
+    float top
+    float bot
+    int   btime
+    int   dir
+
+var array<OB> obs = array.new<OB>()
+if brokeBull
+    for i = 1 to 10
+        if close[i] < open[i]
+            obs.unshift(OB.new(high[i], low[i], time[i], 1))
+            break
+if brokeBear
+    for i = 1 to 10
+        if close[i] > open[i]
+            obs.unshift(OB.new(high[i], low[i], time[i], -1))
+            break
+if obs.size() > 0
+    for i = obs.size() - 1 to 0
+        ob = obs.get(i)
+        if (ob.dir == 1 and close < ob.bot) or (ob.dir == -1 and close > ob.top)
+            obs.remove(i)
+while obs.size() > i_maxOB
+    obs.pop()
+
+// ── FVGs ──────────────────────────────────────────────────────────────────
+type FVG
+    float top
+    float bot
+    int   btime
+    int   dir
+
+var array<FVG> fvgs = array.new<FVG>()
+fvgUp = low - high[2]
+fvgDn = low[2] - high
+if fvgUp > atr * i_fvgMinATR
+    fvgs.unshift(FVG.new(low,     high[2], time[2], 1))
+if fvgDn > atr * i_fvgMinATR
+    fvgs.unshift(FVG.new(low[2],  high,    time[2], -1))
+if fvgs.size() > 0
+    for i = fvgs.size() - 1 to 0
+        fvg = fvgs.get(i)
+        if (fvg.dir == 1 and close < fvg.bot) or (fvg.dir == -1 and close > fvg.top)
+            fvgs.remove(i)
+while fvgs.size() > i_maxFVG
+    fvgs.pop()
+
+// ── Prior-day sweep ───────────────────────────────────────────────────────
+isNewDay = ta.change(time("D")) != 0
+var float pdh = na
+var float pdl = na
+if isNewDay
+    pdh := high[1]
+    pdl := low[1]
+sweepLo = not na(pdl) and low  < pdl - sweepTol and close > pdl
+sweepHi = not na(pdh) and high > pdh + sweepTol and close < pdh
+var int lastSwpLoBar = na
+var int lastSwpHiBar = na
+if sweepLo
+    lastSwpLoBar := bar_index
+if sweepHi
+    lastSwpHiBar := bar_index
+swpLoActive = not na(lastSwpLoBar) and (bar_index - lastSwpLoBar) <= i_sweepWindow
+swpHiActive = not na(lastSwpHiBar) and (bar_index - lastSwpHiBar) <= i_sweepWindow
+
+// ── Zone touch (this bar) ─────────────────────────────────────────────────
+bool zoneBull = false
+bool zoneBear = false
+if obs.size() > 0
+    for [_, ob] in obs
+        if not zoneBull and ob.dir == 1  and low  <= ob.top and low  >= ob.bot
+            zoneBull := true
+        if not zoneBear and ob.dir == -1 and high >= ob.bot and high <= ob.top
+            zoneBear := true
+if fvgs.size() > 0
+    for [_, fvg] in fvgs
+        if not zoneBull and fvg.dir == 1  and low  <= fvg.top and low  >= fvg.bot
+            zoneBull := true
+        if not zoneBear and fvg.dir == -1 and high >= fvg.bot and high <= fvg.top
+            zoneBear := true
+
+// ── Signal ────────────────────────────────────────────────────────────────
+var int lastSig = 0
+cdOK   = (bar_index - lastSig) >= i_cooldown
+swpOKB = not i_requireSwp or swpLoActive
+swpOKS = not i_requireSwp or swpHiActive
+BUY  = barstate.isconfirmed and cdOK and biasBull and zoneBull and isDispB and swpOKB
+SELL = barstate.isconfirmed and cdOK and biasBear and zoneBear and isDispS and swpOKS
+if BUY or SELL
+    lastSig := bar_index
+
+// ── Drawing (re-rendered on last bar only) ────────────────────────────────
+var array<box> obBoxes  = array.new<box>()
+var array<box> fvgBoxes = array.new<box>()
+if barstate.islast
+    for b in obBoxes
+        box.delete(b)
+    obBoxes.clear()
+    for b in fvgBoxes
+        box.delete(b)
+    fvgBoxes.clear()
+    for [_, ob] in obs
+        c = ob.dir == 1 ? color.new(#2196F3, 80) : color.new(#FF9800, 80)
+        obBoxes.push(box.new(ob.btime, ob.top, time, ob.bot, xloc=xloc.bar_time, bgcolor=c, border_color=color.new(c, 30), extend=extend.right))
+    for [_, fvg] in fvgs
+        c = fvg.dir == 1 ? color.new(#4CAF50, 85) : color.new(#F44336, 85)
+        fvgBoxes.push(box.new(fvg.btime, fvg.top, time, fvg.bot, xloc=xloc.bar_time, bgcolor=c, border_color=color.new(c, 30), extend=extend.right))
+
+plot(pdh, "PDH", color.new(#4CAF50, 30), style=plot.style_circles)
+plot(pdl, "PDL", color.new(#F44336, 30), style=plot.style_circles)
+
+if BUY
+    sl = close - atr * i_slATR
+    tp = close + atr * i_tpATR
+    label.new(bar_index, low, "BUY " + str.tostring(close, "#.##"), style=label.style_label_up, color=color.green, textcolor=color.white, size=size.normal, yloc=yloc.belowbar)
+    line.new(bar_index, sl, bar_index + 20, sl, color=color.red,   style=line.style_dashed)
+    line.new(bar_index, tp, bar_index + 20, tp, color=color.green, style=line.style_dashed)
+    label.new(bar_index + 21, sl, "SL " + str.tostring(sl, "#.##"), color=color(na), textcolor=color.red,   style=label.style_label_left, size=size.tiny)
+    label.new(bar_index + 21, tp, "TP " + str.tostring(tp, "#.##"), color=color(na), textcolor=color.green, style=label.style_label_left, size=size.tiny)
+if SELL
+    sl = close + atr * i_slATR
+    tp = close - atr * i_tpATR
+    label.new(bar_index, high, "SELL " + str.tostring(close, "#.##"), style=label.style_label_down, color=color.red, textcolor=color.white, size=size.normal, yloc=yloc.abovebar)
+    line.new(bar_index, sl, bar_index + 20, sl, color=color.red,   style=line.style_dashed)
+    line.new(bar_index, tp, bar_index + 20, tp, color=color.green, style=line.style_dashed)
+    label.new(bar_index + 21, sl, "SL " + str.tostring(sl, "#.##"), color=color(na), textcolor=color.red,   style=label.style_label_left, size=size.tiny)
+    label.new(bar_index + 21, tp, "TP " + str.tostring(tp, "#.##"), color=color(na), textcolor=color.green, style=label.style_label_left, size=size.tiny)
+
+// ── Mini status ───────────────────────────────────────────────────────────
+var table t = table.new(position.top_right, 2, 4, frame_color=color.gray, frame_width=1)
+if barstate.islast
+    bTxt = biasBull ? "BULL" : biasBear ? "BEAR" : "—"
+    bCol = biasBull ? color.new(color.green, 20) : biasBear ? color.new(color.red, 20) : color.new(color.gray, 40)
+    sTxt = structBias == 1 ? "BULL" : structBias == -1 ? "BEAR" : "—"
+    sCol = structBias == 1 ? color.new(color.green, 30) : structBias == -1 ? color.new(color.red, 30) : color.new(color.gray, 50)
+    table.cell(t, 0, 0, "HTF Bias",  text_color=color.white, bgcolor=bCol, text_size=size.tiny)
+    table.cell(t, 1, 0, bTxt,        text_color=color.white, bgcolor=bCol, text_size=size.tiny)
+    table.cell(t, 0, 1, "Structure", text_color=color.white, bgcolor=sCol, text_size=size.tiny)
+    table.cell(t, 1, 1, sTxt,        text_color=color.white, bgcolor=sCol, text_size=size.tiny)
+    table.cell(t, 0, 2, "Zones",     text_color=color.white, bgcolor=color.new(color.gray, 50), text_size=size.tiny)
+    table.cell(t, 1, 2, "OB:" + str.tostring(obs.size()) + " FVG:" + str.tostring(fvgs.size()), text_color=color.white, bgcolor=color.new(color.gray, 50), text_size=size.tiny)
+    table.cell(t, 0, 3, "Sweep",     text_color=color.white, bgcolor=color.new(color.gray, 50), text_size=size.tiny)
+    table.cell(t, 1, 3, swpLoActive ? "PDL ▲" : swpHiActive ? "PDH ▼" : "—", text_color=color.white, bgcolor=color.new(color.gray, 50), text_size=size.tiny)
+
+// ── Alerts ────────────────────────────────────────────────────────────────
+alertcondition(BUY,  "QF Lean BUY",  "QF Lean BUY {{ticker}} @ {{close}}")
+alertcondition(SELL, "QF Lean SELL", "QF Lean SELL {{ticker}} @ {{close}}")

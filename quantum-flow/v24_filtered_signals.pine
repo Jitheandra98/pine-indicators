@@ -1,0 +1,296 @@
+//@version=6
+indicator("High Prob Adaptive RSI v24 — Filtered + Cooldown + Structure", overlay=true, precision=2, max_labels_count=500, max_lines_count=500)
+
+// =============================================================
+// CHANGES vs v23 (what this version fixes):
+//   1) Adds SIGNAL COOLDOWN so signals don't stack 5x at one swing.
+//   2) Replaces EMA-4 with EMA-20 + optional HTF-EMA trend filter
+//      (EMA-4 was flipping on every wick — counter-trend buys.)
+//   3) Adds ATR VOLATILITY FILTER — skips dead/choppy bars.
+//   4) Adds STRUCTURE FILTER — buys need price still near recent
+//      swing low / sells near recent swing high (no chasing).
+//   5) Raises default slopeThreshold so weak momentum is rejected.
+//   6) Draws SL/TP lines from ATR so you can see R:R at a glance.
+//   7) Tracks a simple WIN/LOSS counter on the dashboard so you
+//      can see whether new settings actually help.
+// =============================================================
+
+// ====================== INPUTS ======================
+// --- RSI ---
+rsiLength        = input.int(120,  "RSI Length",                 group="RSI", tooltip="Was 249 — that was too smooth for the 43-bar adaptive lookback. 60-120 is a better match.")
+lookback         = input.int(60,   "Adaptive Lookback",          group="RSI")
+oversoldMargin   = input.float(0.15,"Oversold Sensitivity",      group="RSI")
+overboughtMargin = input.float(0.15,"Overbought Sensitivity",    group="RSI")
+
+// --- Trend filter ---
+emaLength        = input.int(20,   "EMA Trend Length",           group="Trend", tooltip="20-50 recommended. Your old value of 4 caused counter-trend signals during pullbacks.")
+useHtfTrend      = input.bool(true,"Use Higher TF Trend Filter", group="Trend")
+htfTimeframe     = input.timeframe("60", "HTF Timeframe",         group="Trend")
+htfEmaLength     = input.int(50,   "HTF EMA Length",             group="Trend")
+
+// --- Slope filter ---
+slopeThreshold   = input.float(0.30,"RSI Slope Threshold",       group="Slope", tooltip="Was 0.15 — too permissive. 0.25-0.40 rejects weak momentum.")
+
+// --- Volatility filter ---
+useAtrFilter     = input.bool(true,"Require Above-Avg Volatility", group="Volatility")
+atrLength        = input.int(14,   "ATR Length",                 group="Volatility")
+atrAvgLength     = input.int(50,   "ATR Average Length",         group="Volatility")
+atrMinRatio      = input.float(0.8,"Min ATR / AvgATR",           group="Volatility", tooltip="Skip signals when current ATR is below 80% of its 50-bar average.")
+
+// --- Structure filter ---
+useStructure     = input.bool(true,"Require Structure Confirmation", group="Structure", tooltip="Buys must come from near a recent swing low; sells from near a recent swing high. Prevents chasing.")
+structureLookback= input.int(20,   "Structure Lookback",         group="Structure")
+structureMaxDist = input.float(2.0,"Max ATR distance from swing",group="Structure")
+
+// --- Cooldown ---
+signalCooldown   = input.int(10,   "Bars Between High-Prob Signals", group="Cooldown", tooltip="Prevents 5 SELL labels stacking at the same swing high.")
+
+// --- Divergence ---
+divPivotLeft     = input.int(5,    "Divergence Pivot Left",      group="Divergence")
+divPivotRight    = input.int(5,    "Divergence Pivot Right",     group="Divergence")
+showDivergences  = input.bool(true,"Show Divergences",           group="Divergence")
+
+// --- Killzones ---
+killzoneMode     = input.string("Both", "Killzone Mode", options=["Off","London","New York","Both"], group="Killzones")
+killzoneOn       = input.bool(true,"Enforce Killzone for High-Prob", group="Killzones")
+
+// --- Opposite Market ---
+useOpposite      = input.bool(true,"Enable Opposite Market Confirmation", group="Opposite Market")
+oppSymbol        = input.symbol("TVC:DXY", "Opposite Symbol",   group="Opposite Market")
+oppEmaLength     = input.int(20,   "Opposite EMA Length",        group="Opposite Market", tooltip="Was 4 — too noisy. 20 gives a real bias read.")
+
+// --- Display ---
+showsignals      = input.bool(true,"Show Buy/Sell Labels",       group="Display")
+showWeakSignals  = input.bool(false,"Show Weak (non-high-prob) Signals", group="Display", tooltip="Hide weak labels by default — they were adding visual noise.")
+showLevels       = input.bool(true,"Show SL/TP Lines",           group="Display")
+slAtrMult        = input.float(1.5,"Stop Loss ATR Multiplier",   group="Display")
+tpAtrMult        = input.float(3.0,"Take Profit ATR Multiplier", group="Display")
+trackPerformance = input.bool(true,"Track Win/Loss in Dashboard",group="Display")
+
+// ====================== RSI ======================
+rsiVal              = ta.rsi(close, rsiLength)
+rsiMax              = ta.highest(rsiVal, lookback)
+rsiMin              = ta.lowest(rsiVal,  lookback)
+rsiRange            = rsiMax - rsiMin
+adaptiveOverbought  = rsiMax - rsiRange * overboughtMargin
+adaptiveOversold    = rsiMin + rsiRange * oversoldMargin
+rsiSlope            = rsiVal - rsiVal[1]
+
+// ====================== TREND ======================
+emaTrend  = ta.ema(close, emaLength)
+htfClose  = useHtfTrend ? request.security(syminfo.tickerid, htfTimeframe, close) : na
+htfEma    = useHtfTrend ? request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, htfEmaLength)) : na
+
+trendBull = close > emaTrend and (not useHtfTrend or (not na(htfClose) and not na(htfEma) and htfClose > htfEma))
+trendBear = close < emaTrend and (not useHtfTrend or (not na(htfClose) and not na(htfEma) and htfClose < htfEma))
+
+// ====================== VOLATILITY ======================
+atrVal       = ta.atr(atrLength)
+avgAtr       = ta.sma(atrVal, atrAvgLength)
+hasVolatility = not useAtrFilter or (atrVal >= avgAtr * atrMinRatio)
+
+// ====================== STRUCTURE ======================
+recentSwingLow  = ta.lowest(low,  structureLookback)
+recentSwingHigh = ta.highest(high, structureLookback)
+distFromLow     = (close - recentSwingLow)  / atrVal
+distFromHigh    = (recentSwingHigh - close) / atrVal
+nearSwingLow    = not useStructure or distFromLow  <= structureMaxDist
+nearSwingHigh   = not useStructure or distFromHigh <= structureMaxDist
+
+// ====================== OPPOSITE MARKET ======================
+float oppClose    = na
+float oppEmaTrend = na
+bool  oppBull     = false
+bool  oppBear     = false
+if useOpposite
+    oppClose    := request.security(oppSymbol, timeframe.period, close)
+    oppEmaTrend := request.security(oppSymbol, timeframe.period, ta.ema(close, oppEmaLength))
+    oppBull     := not na(oppClose) and not na(oppEmaTrend) and (oppClose > oppEmaTrend)
+    oppBear     := not na(oppClose) and not na(oppEmaTrend) and (oppClose < oppEmaTrend)
+
+// ====================== KILLZONES ======================
+sessionLondon = "0200-0500"
+sessionNY     = "0700-1100"
+inLondon      = not na(time(timeframe.period, sessionLondon))
+inNY          = not na(time(timeframe.period, sessionNY))
+inKillzone    = killzoneMode == "Off"    ? true :
+                killzoneMode == "Both"   ? (inLondon or inNY) :
+                killzoneMode == "London" ? inLondon :
+                killzoneMode == "New York" ? inNY : true
+killzoneActiveText = killzoneMode == "Off" ? "Off" : (inKillzone ? "Active" : "Inactive")
+activeWhich = killzoneMode == "Both"   ? (inLondon ? "London" : inNY ? "NY" : "None") :
+              killzoneMode == "London" ? "London" :
+              killzoneMode == "New York" ? "NY" : "None"
+
+// ====================== BASE SIGNALS ======================
+baseBuy  = ta.crossover(rsiVal,  adaptiveOversold)
+baseSell = ta.crossunder(rsiVal, adaptiveOverbought)
+
+buyConfirmedByOpp  = not useOpposite or oppBear
+sellConfirmedByOpp = not useOpposite or oppBull
+
+normalBuy  = baseBuy  and buyConfirmedByOpp
+normalSell = baseSell and sellConfirmedByOpp
+
+// ====================== HIGH-PROB (with all filters) ======================
+highProbBuyRaw  = normalBuy  and trendBull and rsiSlope >  slopeThreshold and (not killzoneOn or inKillzone) and hasVolatility and nearSwingLow
+highProbSellRaw = normalSell and trendBear and rsiSlope < -slopeThreshold and (not killzoneOn or inKillzone) and hasVolatility and nearSwingHigh
+
+// ====================== COOLDOWN (fixes signal stacking) ======================
+var int lastHighProbBuyBar  = -10000
+var int lastHighProbSellBar = -10000
+highProbBuy  = highProbBuyRaw  and (bar_index - lastHighProbBuyBar)  >= signalCooldown
+highProbSell = highProbSellRaw and (bar_index - lastHighProbSellBar) >= signalCooldown
+if highProbBuy
+    lastHighProbBuyBar  := bar_index
+if highProbSell
+    lastHighProbSellBar := bar_index
+
+// ====================== SL / TP LEVELS ======================
+var float activeBuyEntry  = na
+var float activeBuySL     = na
+var float activeBuyTP     = na
+var int   activeBuyBar    = na
+var float activeSellEntry = na
+var float activeSellSL    = na
+var float activeSellTP    = na
+var int   activeSellBar   = na
+
+// ====================== PERFORMANCE TRACKING ======================
+var int buyWins   = 0
+var int buyLosses = 0
+var int sellWins  = 0
+var int sellLosses= 0
+
+if trackPerformance
+    // resolve any open BUY
+    if not na(activeBuyEntry)
+        if high >= activeBuyTP
+            buyWins   += 1
+            activeBuyEntry := na
+        else if low <= activeBuySL
+            buyLosses += 1
+            activeBuyEntry := na
+    // resolve any open SELL
+    if not na(activeSellEntry)
+        if low <= activeSellTP
+            sellWins   += 1
+            activeSellEntry := na
+        else if high >= activeSellSL
+            sellLosses += 1
+            activeSellEntry := na
+
+if highProbBuy
+    activeBuyEntry := close
+    activeBuySL    := close - atrVal * slAtrMult
+    activeBuyTP    := close + atrVal * tpAtrMult
+    activeBuyBar   := bar_index
+if highProbSell
+    activeSellEntry := close
+    activeSellSL    := close + atrVal * slAtrMult
+    activeSellTP    := close - atrVal * tpAtrMult
+    activeSellBar   := bar_index
+
+// ====================== DIVERGENCES ======================
+pivotLowPrice  = ta.pivotlow(low,    divPivotLeft, divPivotRight)
+pivotHighPrice = ta.pivothigh(high,  divPivotLeft, divPivotRight)
+pivotLowRSI    = ta.pivotlow(rsiVal, divPivotLeft, divPivotRight)
+pivotHighRSI   = ta.pivothigh(rsiVal, divPivotLeft, divPivotRight)
+
+var float lastLowPrice  = na
+var float lastLowRSI    = na
+var int   lastLowBar    = na
+var float lastHighPrice = na
+var float lastHighRSI   = na
+var int   lastHighBar   = na
+
+if showDivergences
+    if not na(pivotLowPrice) and not na(pivotLowRSI)
+        if not na(lastLowPrice)
+            if pivotLowPrice < lastLowPrice and pivotLowRSI > lastLowRSI
+                line.new(lastLowBar, lastLowPrice, bar_index - divPivotRight, pivotLowPrice, color=color.lime, width=2)
+            if pivotLowPrice > lastLowPrice and pivotLowRSI < lastLowRSI
+                line.new(lastLowBar, lastLowPrice, bar_index - divPivotRight, pivotLowPrice, color=color.teal, width=2, style=line.style_dashed)
+        lastLowPrice := pivotLowPrice
+        lastLowRSI   := pivotLowRSI
+        lastLowBar   := bar_index - divPivotRight
+
+    if not na(pivotHighPrice) and not na(pivotHighRSI)
+        if not na(lastHighPrice)
+            if pivotHighPrice > lastHighPrice and pivotHighRSI < lastHighRSI
+                line.new(lastHighBar, lastHighPrice, bar_index - divPivotRight, pivotHighPrice, color=color.red, width=2)
+            if pivotHighPrice < lastHighPrice and pivotHighRSI > lastHighRSI
+                line.new(lastHighBar, lastHighPrice, bar_index - divPivotRight, pivotHighPrice, color=color.orange, width=2, style=line.style_dashed)
+        lastHighPrice := pivotHighPrice
+        lastHighRSI   := pivotHighRSI
+        lastHighBar   := bar_index - divPivotRight
+
+// ====================== LABELS ======================
+if showsignals
+    if showWeakSignals and normalBuy and not highProbBuy
+        label.new(bar_index, low,  "BUY",  style=label.style_label_up,   color=color.new(color.green, 60), textcolor=color.white, size=size.tiny,  yloc=yloc.belowbar)
+    if showWeakSignals and normalSell and not highProbSell
+        label.new(bar_index, high, "SELL", style=label.style_label_down, color=color.new(color.red,   60), textcolor=color.white, size=size.tiny,  yloc=yloc.abovebar)
+    if highProbBuy
+        label.new(bar_index, low,  "HIGH PROB BUY",  style=label.style_label_up,   color=color.green, textcolor=color.white, size=size.normal, yloc=yloc.belowbar)
+    if highProbSell
+        label.new(bar_index, high, "HIGH PROB SELL", style=label.style_label_down, color=color.red,   textcolor=color.white, size=size.normal, yloc=yloc.abovebar)
+
+// ====================== SL/TP LINES ======================
+if showLevels
+    if highProbBuy
+        line.new(bar_index, activeBuySL, bar_index + 30, activeBuySL, color=color.new(color.red,  20), width=1, style=line.style_dashed)
+        line.new(bar_index, activeBuyTP, bar_index + 30, activeBuyTP, color=color.new(color.lime, 20), width=1, style=line.style_dashed)
+    if highProbSell
+        line.new(bar_index, activeSellSL, bar_index + 30, activeSellSL, color=color.new(color.red,  20), width=1, style=line.style_dashed)
+        line.new(bar_index, activeSellTP, bar_index + 30, activeSellTP, color=color.new(color.lime, 20), width=1, style=line.style_dashed)
+
+// ====================== CANDLE COLORING ======================
+barcolor(highProbBuy ? color.new(color.green, 50) : highProbSell ? color.new(color.red, 50) : na)
+
+// ====================== KILLZONE BACKGROUND ======================
+inLondonBG = killzoneMode == "Off" ? false : (killzoneMode == "London" ? inLondon : (killzoneMode == "New York" ? false : (killzoneMode == "Both" ? inLondon : false)))
+inNYBG     = killzoneMode == "Off" ? false : (killzoneMode == "New York" ? inNY : (killzoneMode == "Both" ? inNY : false))
+bgcolor(inLondonBG ? color.new(color.blue, 92) : inNYBG ? color.new(color.purple, 92) : na)
+
+// ====================== DASHBOARD ======================
+var label dash = na
+if barstate.islast
+    label.delete(dash)
+    biasText    = trendBull ? "BULL" : trendBear ? "BEAR" : "NEUTRAL"
+    rsiRegime   = rsiVal > adaptiveOverbought ? "OVERBOUGHT" : rsiVal < adaptiveOversold ? "OVERSOLD" : "NEUTRAL"
+    slopeText   = rsiSlope > slopeThreshold ? "STRONG UP" : rsiSlope < -slopeThreshold ? "STRONG DOWN" : rsiSlope > 0 ? "weak up" : rsiSlope < 0 ? "weak down" : "flat"
+    volText     = hasVolatility ? "OK" : "LOW (filtered out)"
+    structText  = "L:" + str.tostring(distFromLow, "#.#") + " H:" + str.tostring(distFromHigh, "#.#") + " ATR"
+    signalText  = highProbBuy ? "HIGH PROB BUY" : highProbSell ? "HIGH PROB SELL" : normalBuy ? "weak BUY" : normalSell ? "weak SELL" : "NONE"
+
+    totalBuy    = buyWins + buyLosses
+    totalSell   = sellWins + sellLosses
+    buyWR       = totalBuy  > 0 ? (buyWins  * 100.0 / totalBuy)  : 0.0
+    sellWR      = totalSell > 0 ? (sellWins * 100.0 / totalSell) : 0.0
+
+    dashText = "=== DASHBOARD v24 ===\n" +
+       "Trend (LTF): " + biasText + "\n" +
+       "HTF Trend: "  + (useHtfTrend ? (not na(htfClose) and not na(htfEma) and htfClose > htfEma ? "BULL" : not na(htfClose) and not na(htfEma) and htfClose < htfEma ? "BEAR" : "?") : "off") + "\n" +
+       "RSI: " + str.tostring(rsiVal, "#.##") + " (" + rsiRegime + ")\n" +
+       "Slope: " + slopeText + " (" + str.tostring(rsiSlope, "#.##") + ")\n" +
+       "Volatility: " + volText + "\n" +
+       "Dist to swings: " + structText + "\n" +
+       "Killzone: " + killzoneActiveText + " (" + activeWhich + ")\n" +
+       "Signal: " + signalText + "\n"
+
+    if useOpposite
+        oppText = oppBull ? "Bull" : oppBear ? "Bear" : "?"
+        dashText += "Opp (" + oppSymbol + "): " + oppText + "\n"
+
+    if trackPerformance
+        dashText += "---\n" +
+           "Backtest (TP/SL hit, from chart start):\n" +
+           "BUY:  " + str.tostring(buyWins)  + "W / " + str.tostring(buyLosses)  + "L  (" + str.tostring(buyWR,  "#.#") + "%)\n" +
+           "SELL: " + str.tostring(sellWins) + "W / " + str.tostring(sellLosses) + "L  (" + str.tostring(sellWR, "#.#") + "%)"
+
+    dash := label.new(bar_index, high * 1.02, dashText, xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, color=color.new(color.black, 0), textcolor=color.white, size=size.large)
+
+// ====================== ALERTS ======================
+alertcondition(highProbBuy,  "High Prob BUY",  "High Prob BUY on {{ticker}} at {{close}}")
+alertcondition(highProbSell, "High Prob SELL", "High Prob SELL on {{ticker}} at {{close}}")

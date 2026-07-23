@@ -1,0 +1,206 @@
+//@version=6
+// ════════════════════════════════════════════════════════════════════════
+// MGC Asian-Range Break — Honest P&L v1.0
+// ONE edge: London breakout of the Asian range (the only two-sided, data-
+// supported edge from the 50-session study: ~65-68% follow-through).
+// P&L is CONSERVATIVE on purpose — ambiguous SL+TP bars count as LOSSES,
+// commissions + slippage are deducted, and long-only vs short-only nets are
+// shown separately so "gold just drifted up" (BETA) cannot hide as edge.
+// ════════════════════════════════════════════════════════════════════════
+indicator("MGC Asian-Range Break — Honest P&L v1.0", overlay=true, max_labels_count=300, max_lines_count=300)
+
+// ── inputs ──
+tz       = input.string("UTC", "Session timezone", group="Sessions")
+aStart   = input.int(0,  "Asian start (h)",            0, 23, group="Sessions")
+aEnd     = input.int(7,  "Asian end / London start (h)",0, 23, group="Sessions")
+lEnd     = input.int(12, "London entry cutoff (h)",    0, 23, group="Sessions")
+eodH     = input.int(21, "Force-close hour (h)",       0, 23, group="Sessions")
+
+useFixed = input.bool(false, "Stop = fixed pts (else opposite Asian extreme)", group="Risk")
+fixedPts = input.float(8.0,  "  └ Fixed stop (pts)", group="Risk")
+rMult    = input.float(1.5,  "Target (R multiple)", minval=0.2, group="Risk")
+minRange = input.float(3.0,  "Min Asian range (pts) to trade", group="Risk")
+maxRange = input.float(40.0, "Max Asian range (pts) to trade", group="Risk")
+
+contracts = input.int(1,     "Contracts", minval=1, group="P&L")
+ptValue   = input.float(10.0,"$ per point (MGC=10)", group="P&L")
+commSide  = input.float(0.74,"Commission $/side", group="P&L")
+slipPts   = input.float(0.1, "Slippage (pts/side)", group="P&L")
+
+showLines = input.bool(true, "Draw Asian range + trade levels", group="Display")
+
+useHTF    = input.bool(true,  "HTF bias filter (long only if HTF up, short only if down)", group="HTF Filter")
+htfTf     = input.timeframe("D", "HTF timeframe", group="HTF Filter")
+htfEmaLen = input.int(20, "HTF EMA length", minval=2, group="HTF Filter")
+
+// ── session flags ──
+h      = hour(time, tz)
+newDay = ta.change(time("D")) != 0
+inAsian  = h >= aStart and h < aEnd
+inLondon = h >= aEnd   and h < lEnd
+
+// ── Asian range ──
+var float aHigh = na
+var float aLow  = na
+var bool  traded = false
+if newDay
+    aHigh := na
+    aLow  := na
+    traded := false
+if inAsian
+    aHigh := na(aHigh) ? high : math.max(aHigh, high)
+    aLow  := na(aLow)  ? low  : math.min(aLow,  low)
+aRange = (not na(aHigh) and not na(aLow)) ? aHigh - aLow : na
+
+// ── HTF bias (simple, no look-ahead) ──
+htfEma   = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfEmaLen), lookahead=barmerge.lookahead_off)
+htfPrice = request.security(syminfo.tickerid, htfTf, close, lookahead=barmerge.lookahead_off)
+htfBias  = na(htfEma) or na(htfPrice) ? 0 : htfPrice > htfEma ? 1 : -1
+var int nSkip = 0
+
+// ── trade state ──
+var int    pos      = 0
+var float  entry    = na
+var float  stop     = na
+var float  tgt      = na
+var int    entryBar = na
+
+// ── stats ── (each var on its OWN line: Pine applies `var` only to the first
+//             item in a comma list, so multi-declares silently reset each bar)
+var int   nTr=0
+var int   nWin=0
+var float winD=0.0
+var float lossD=0.0
+var float netP=0.0
+var float grossP=0.0
+var float sumWinR=0.0
+var float sumLossR=0.0
+var int   nLong=0
+var int   nLongWin=0
+var int   nShort=0
+var int   nShortWin=0
+var float longNet=0.0
+var float shortNet=0.0
+var float betaStart = na
+if na(betaStart)
+    betaStart := close
+
+// ── entry: confirmed London breakout, one trade/day ──
+rangeOK  = not na(aRange) and aRange >= minRange and aRange <= maxRange
+canEnter = inLondon and not traded and pos == 0 and rangeOK and barstate.isconfirmed
+biasLongOK  = not useHTF or htfBias ==  1
+biasShortOK = not useHTF or htfBias == -1
+longSig  = canEnter and close > aHigh and biasLongOK
+shortSig = canEnter and close < aLow  and biasShortOK
+if canEnter and ((close > aHigh and not biasLongOK) or (close < aLow and not biasShortOK))
+    nSkip += 1
+    traded := true
+
+if longSig
+    pos := 1
+    entry := close
+    entryBar := bar_index
+    traded := true
+    stop := useFixed ? entry - fixedPts : aLow
+    tgt  := entry + (entry - stop) * rMult
+if shortSig
+    pos := -1
+    entry := close
+    entryBar := bar_index
+    traded := true
+    stop := useFixed ? entry + fixedPts : aHigh
+    tgt  := entry - (stop - entry) * rMult
+
+// ── exit (conservative: SL checked first => ambiguous bar = loss) ──
+float exitPx = na
+if pos != 0 and bar_index > entryBar
+    force = h >= eodH
+    if pos == 1
+        if low <= stop
+            exitPx := stop
+        else if high >= tgt
+            exitPx := tgt
+        else if force
+            exitPx := close
+    else
+        if high >= stop
+            exitPx := stop
+        else if low <= tgt
+            exitPx := tgt
+        else if force
+            exitPx := close
+
+if not na(exitPx)
+    pts   = pos == 1 ? (exitPx - entry) : (entry - exitPx)
+    gross = pts * ptValue * contracts
+    costs = (commSide * 2 + slipPts * ptValue * 2) * contracts
+    net   = gross - costs
+    risk  = math.abs(entry - stop)
+    rr    = risk > 0 ? pts / risk : 0.0
+    nTr += 1
+    grossP += gross
+    netP   += net
+    win = net > 0
+    if win
+        nWin += 1
+        winD += net
+        sumWinR += rr
+    else
+        lossD += math.abs(net)
+        sumLossR += math.abs(rr)
+    if pos == 1
+        nLong += 1
+        longNet += net
+        nLongWin += win ? 1 : 0
+    else
+        nShort += 1
+        shortNet += net
+        nShortWin += win ? 1 : 0
+    label.new(bar_index, exitPx, (win?"+":"")+"$"+str.tostring(net,"#.#"), style=pos==1?label.style_label_down:label.style_label_up, color=win?color.new(color.teal,30):color.new(color.red,30), textcolor=color.white, size=size.tiny)
+    pos := 0
+    entry := na
+    stop := na
+    tgt := na
+
+// ── visuals ──
+plot(showLines and not na(aHigh) ? aHigh : na, "Asian H", color.new(color.orange,0), 1, plot.style_linebr)
+plot(showLines and not na(aLow)  ? aLow  : na, "Asian L", color.new(color.orange,0), 1, plot.style_linebr)
+plot(showLines and pos!=0 ? stop : na, "Stop", color.new(color.red,0),  1, plot.style_linebr)
+plot(showLines and pos!=0 ? tgt  : na, "Tgt",  color.new(color.teal,0), 1, plot.style_linebr)
+bgcolor(inLondon ? color.new(color.blue, 92) : na)
+
+// ── beta benchmark + verdict ──
+betaNet  = not na(betaStart) ? (close - betaStart) * ptValue * contracts : 0.0
+wr       = nTr  > 0 ? nWin*100.0/nTr : 0.0
+lwr      = nLong > 0 ? nLongWin*100.0/nLong : 0.0
+swr      = nShort> 0 ? nShortWin*100.0/nShort : 0.0
+pf       = lossD > 0 ? winD/lossD : na
+expR     = nTr > 0 ? (sumWinR - sumLossR)/nTr : 0.0
+twoSided = longNet > 0 and shortNet > 0
+verdict  = nTr < 10 ? "NEED >10 TRADES" : twoSided ? "STRUCTURE (2-sided)" : (longNet>0 and shortNet<=0 and betaNet>0 ? "BETA RISK (longs only)" : netP>0 ? "MIXED — watch beta" : "NO EDGE")
+vCol     = nTr < 10 ? color.gray : twoSided ? color.teal : (longNet>0 and shortNet<=0 and betaNet>0 ? color.orange : color.red)
+
+// ── dashboard ──
+var table dash = table.new(position.bottom_right, 2, 14, border_width=1)
+f_row(i, k, v, c) =>
+    table.cell(dash, 0, i, k, text_color=color.white, bgcolor=color.new(color.gray,70), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, i, v, text_color=color.white, bgcolor=c, text_size=size.tiny, text_halign=text.align_right)
+if barstate.islast
+    f_row(0,  "ASIAN-RANGE BREAK", "Honest P&L", color.new(color.blue,40))
+    f_row(1,  "Trades / WR", str.tostring(nTr)+" / "+str.tostring(wr,"#")+"%", color.new(color.gray,60))
+    f_row(2,  "NET $ (a/comm)", (netP>=0?"+$":"-$")+str.tostring(math.abs(netP),"#"), netP>=0?color.new(color.teal,30):color.new(color.red,30))
+    f_row(3,  "Gross $", (grossP>=0?"+$":"-$")+str.tostring(math.abs(grossP),"#"), color.new(color.gray,60))
+    f_row(4,  "Profit factor", na(pf)?"—":str.tostring(pf,"#.##"), color.new(color.gray,60))
+    f_row(5,  "Expectancy (R)", str.tostring(expR,"#.##")+"R", expR>=0?color.new(color.teal,40):color.new(color.red,40))
+    f_row(6,  "LONG n/WR/net", str.tostring(nLong)+"/"+str.tostring(lwr,"#")+"%/"+(longNet>=0?"+":"")+str.tostring(longNet,"#"), longNet>=0?color.new(color.teal,50):color.new(color.red,50))
+    f_row(7,  "SHORT n/WR/net", str.tostring(nShort)+"/"+str.tostring(swr,"#")+"%/"+(shortNet>=0?"+":"")+str.tostring(shortNet,"#"), shortNet>=0?color.new(color.teal,50):color.new(color.red,50))
+    f_row(8,  "Buy&hold (beta)", (betaNet>=0?"+$":"-$")+str.tostring(math.abs(betaNet),"#"), color.new(color.purple,40))
+    f_row(9,  "Net − beta", ((netP-betaNet)>=0?"+$":"-$")+str.tostring(math.abs(netP-betaNet),"#"), color.new(color.gray,50))
+    f_row(10, "VERDICT", verdict, color.new(vCol,20))
+    f_row(11, "Pos now", pos==1?"LONG":pos==-1?"SHORT":"flat", color.new(color.gray,70))
+    f_row(12, "HTF filter", useHTF ? (htfTf+" "+(htfBias==1?"UP":htfBias==-1?"DN":"—")) : "OFF", color.new(color.gray,55))
+    f_row(13, "Signals skipped", str.tostring(nSkip), color.new(color.gray,55))
+
+// ── alerts ──
+alertcondition(longSig,  "Asian-Break LONG",  "MGC London breakout LONG")
+alertcondition(shortSig, "Asian-Break SHORT", "MGC London breakout SHORT")

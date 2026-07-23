@@ -1,0 +1,218 @@
+//@version=6
+// ════════════════════════════════════════════════════════════════════════
+// OB REACT v1.0 — built from ZONE_RESEARCH_REPORT (Jun 22 – Jul 17 study)
+// The ONE setup that passed the honesty gate two-sided (+$189, PF 1.6,
+// longs AND shorts positive while buy&hold lost $210):
+//   › Order-block REACTIONS only. First touch of an unmitigated OB.
+//   › Stop past the far edge, 1.5R target.
+//   › A broken OB is DEAD — flagged, never traded (breakers lost -$381, PF 0.3).
+//   › FVGs deliberately excluded (net negative as entries).
+// Honest P&L: SL-first on ambiguous bars, per-trade cost deducted,
+// long/short split + two-sided verdict + buy&hold benchmark.
+// ════════════════════════════════════════════════════════════════════════
+indicator("OB REACT v1.0", overlay=true, max_boxes_count=250, max_labels_count=250, max_lines_count=100)
+
+// ── inputs (10) ──
+pivLen   = input.int(3,    "Swing pivot length", minval=2, maxval=10, group="Zones")
+maxAge   = input.int(30,   "Max bars: swing → BOS", minval=5, group="Zones")
+minSize  = input.float(1.0,"Min zone size ($)", group="Zones")
+maxSize  = input.float(30.0,"Max zone size ($)", group="Zones")
+rMult    = input.float(1.5,"Target (R multiple)", minval=0.5, group="Trade")
+slPad    = input.float(0.1,"Stop pad (fraction of zone)", minval=0.0, maxval=0.5, group="Trade")
+maxHold  = input.int(40,   "Max bars in trade", minval=5, group="Trade")
+costPer  = input.float(1.0,"Cost $/trade (comm+slip)", group="P&L")
+showVol  = input.bool(true,"Shade volatility go-windows (12-15 & 00-02 UTC)", group="Display")
+showDead = input.bool(true,"Show broken (dead) zones", group="Display")
+
+GREEN = #0E6E56
+RED   = #A32D2D
+GRAY  = color.new(color.gray, 70)
+
+// ── swing pivots → BOS → order blocks ──
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low, pivLen, pivLen)
+var float lastSH = na
+var int   lastSHbar = na
+var float lastSL = na
+var int   lastSLbar = na
+if not na(ph)
+    lastSH := ph
+    lastSHbar := bar_index - pivLen
+if not na(pl)
+    lastSL := pl
+    lastSLbar := bar_index - pivLen
+
+type Zone
+    float top
+    float bot
+    int   dir
+    int   born
+    bool  touched = false
+    bool  dead = false
+    box   bx
+    bool  inTrade = false
+    float entry = na
+    float stop = na
+    float tgt = na
+    int   entryBar = na
+
+var array<Zone> zones = array.new<Zone>()
+
+f_newZone(float t, float b, int d) =>
+    col = d == 1 ? color.new(GREEN, 78) : color.new(RED, 78)
+    bcol = d == 1 ? color.new(GREEN, 40) : color.new(RED, 40)
+    bx = box.new(bar_index, t, bar_index + 1, b, border_color=bcol, bgcolor=col, extend=extend.right)
+    Zone.new(t, b, d, bar_index, bx=bx)
+
+// bullish BOS → demand OB = last bearish candle before the break
+bullBOS = not na(lastSH) and close > lastSH and (bar_index - lastSHbar) <= maxAge
+bearBOS = not na(lastSL) and close < lastSL and (bar_index - lastSLbar) <= maxAge
+if bullBOS
+    int found = na
+    for k = 0 to math.min(bar_index - lastSHbar, 20)
+        if close[k] < open[k]
+            found := k
+            break
+    if not na(found)
+        t = high[found]
+        b = low[found]
+        if (t - b) >= minSize and (t - b) <= maxSize
+            zones.push(f_newZone(t, b, 1))
+    lastSH := na
+if bearBOS
+    int found2 = na
+    for k = 0 to math.min(bar_index - lastSLbar, 20)
+        if close[k] > open[k]
+            found2 := k
+            break
+    if not na(found2)
+        t2 = high[found2]
+        b2 = low[found2]
+        if (t2 - b2) >= minSize and (t2 - b2) <= maxSize
+            zones.push(f_newZone(t2, b2, -1))
+    lastSL := na
+
+// ── honest stats (each var on its own line — Pine comma-var gotcha) ──
+var int   nTr = 0
+var int   nWin = 0
+var float netP = 0.0
+var float winD = 0.0
+var float lossD = 0.0
+var int   nLong = 0
+var int   nLongW = 0
+var float longNet = 0.0
+var int   nShort = 0
+var int   nShortW = 0
+var float shortNet = 0.0
+var float sumR = 0.0
+var float betaStart = na
+if na(betaStart)
+    betaStart := close
+
+bool sigLong = false
+bool sigShort = false
+
+// ── walk zones: touch → trade; break → dead ──
+if zones.size() > 0
+    for i = zones.size() - 1 to 0
+        z = zones.get(i)
+        if z.dead
+            continue
+        prox = z.dir == 1 ? z.top : z.bot
+        far  = z.dir == 1 ? z.bot : z.top
+        size = z.top - z.bot
+        // manage open trade on this zone
+        if z.inTrade
+            hitSL = z.dir == 1 ? low <= z.stop : high >= z.stop
+            hitTP = z.dir == 1 ? high >= z.tgt : low <= z.tgt
+            stale = (bar_index - z.entryBar) >= maxHold
+            if hitSL or hitTP or stale
+                exitPx = hitSL ? z.stop : hitTP ? z.tgt : close
+                pts = (z.dir == 1 ? exitPx - z.entry : z.entry - exitPx) - costPer
+                nTr += 1
+                netP += pts
+                risk = math.abs(z.entry - z.stop)
+                sumR += risk > 0 ? pts / risk : 0
+                if pts > 0
+                    nWin += 1
+                    winD += pts
+                else
+                    lossD += math.abs(pts)
+                if z.dir == 1
+                    nLong += 1
+                    longNet += pts
+                    nLongW += pts > 0 ? 1 : 0
+                else
+                    nShort += 1
+                    shortNet += pts
+                    nShortW += pts > 0 ? 1 : 0
+                label.new(bar_index, exitPx, (pts > 0 ? "+" : "") + "$" + str.tostring(pts, "#.#"), style=z.dir == 1 ? label.style_label_down : label.style_label_up, color=pts > 0 ? color.new(GREEN, 20) : color.new(RED, 20), textcolor=color.white, size=size.tiny)
+                z.inTrade := false
+                z.dead := true
+                z.bx.set_extend(extend.none)
+                z.bx.set_right(bar_index)
+        // zone break check (close beyond far edge) → DEAD, never a breaker entry
+        if not z.dead and ((z.dir == 1 and close < far) or (z.dir == -1 and close > far))
+            z.dead := true
+            z.bx.set_extend(extend.none)
+            z.bx.set_right(bar_index)
+            if showDead
+                z.bx.set_bgcolor(GRAY)
+                z.bx.set_border_color(color.new(color.gray, 40))
+                label.new(bar_index, far, "DEAD", style=label.style_label_left, color=GRAY, textcolor=color.white, size=size.tiny)
+            else
+                z.bx.delete()
+        // first touch → signal + open sim trade
+        if not z.dead and not z.touched and bar_index > z.born and barstate.isconfirmed
+            touched = z.dir == 1 ? low <= prox : high >= prox
+            if touched
+                z.touched := true
+                z.inTrade := true
+                z.entry := prox
+                z.stop := z.dir == 1 ? z.bot - size * slPad : z.top + size * slPad
+                z.tgt := z.dir == 1 ? prox + math.abs(prox - z.stop) * rMult : prox - math.abs(prox - z.stop) * rMult
+                z.entryBar := bar_index
+                if z.dir == 1
+                    sigLong := true
+                else
+                    sigShort := true
+// cap stored zones
+if zones.size() > 60
+    old = zones.shift()
+    if old.dead and not showDead
+        old.bx.delete()
+
+plotshape(sigLong,  "OB Long",  shape.triangleup,   location.belowbar, color.new(GREEN, 0), size=size.small)
+plotshape(sigShort, "OB Short", shape.triangledown, location.abovebar, color.new(RED, 0),   size=size.small)
+
+// ── volatility go-windows (research: 12-15 & 00-02 UTC hot; dead 10/17/20/22) ──
+hU = hour(time, "UTC")
+goWin = (hU >= 12 and hU < 15) or (hU >= 0 and hU < 2)
+bgcolor(showVol and goWin ? color.new(GREEN, 94) : na)
+
+// ── dashboard ──
+wr = nTr > 0 ? nWin * 100.0 / nTr : 0.0
+pf = lossD > 0 ? winD / lossD : na
+expR = nTr > 0 ? sumR / nTr : 0.0
+betaNet = not na(betaStart) ? close - betaStart : 0.0
+twoSided = longNet > 0 and shortNet > 0
+verdict = nTr < 15 ? "NEED >15" : twoSided ? "STRUCTURE ✓" : netP > 0 ? "ONE-SIDED (beta?)" : "NO EDGE"
+vCol = nTr < 15 ? color.gray : twoSided ? GREEN : netP > 0 ? color.orange : RED
+
+var table dash = table.new(position.bottom_right, 2, 9, border_width=1)
+f_row(int r, string k2, string v2, color c) =>
+    table.cell(dash, 0, r, k2, text_color=color.white, bgcolor=color.new(color.gray, 65), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, v2, text_color=color.white, bgcolor=c, text_size=size.tiny, text_halign=text.align_right)
+if barstate.islast
+    f_row(0, "OB REACT", "honest P&L", color.new(GREEN, 35))
+    f_row(1, "Trades / WR", str.tostring(nTr) + " / " + str.tostring(wr, "#") + "%", color.new(color.gray, 55))
+    f_row(2, "Net $ (a/cost)", (netP >= 0 ? "+$" : "-$") + str.tostring(math.abs(netP), "#.#"), netP >= 0 ? color.new(GREEN, 30) : color.new(RED, 30))
+    f_row(3, "PF / Exp R", (na(pf) ? "—" : str.tostring(pf, "#.##")) + " / " + str.tostring(expR, "#.##"), color.new(color.gray, 55))
+    f_row(4, "LONG n/WR/net", str.tostring(nLong) + "/" + str.tostring(nLong > 0 ? nLongW * 100.0 / nLong : 0, "#") + "%/" + (longNet >= 0 ? "+" : "") + str.tostring(longNet, "#"), longNet >= 0 ? color.new(GREEN, 45) : color.new(RED, 45))
+    f_row(5, "SHORT n/WR/net", str.tostring(nShort) + "/" + str.tostring(nShort > 0 ? nShortW * 100.0 / nShort : 0, "#") + "%/" + (shortNet >= 0 ? "+" : "") + str.tostring(shortNet, "#"), shortNet >= 0 ? color.new(GREEN, 45) : color.new(RED, 45))
+    f_row(6, "Buy&hold", (betaNet >= 0 ? "+$" : "-$") + str.tostring(math.abs(betaNet), "#"), color.new(color.purple, 45))
+    f_row(7, "Go-window now", goWin ? "YES — hot hours" : "no", goWin ? color.new(GREEN, 30) : color.new(color.gray, 60))
+    f_row(8, "VERDICT", verdict, color.new(vCol, 20))
+
+alertcondition(sigLong,  "OB REACT Long",  "OB REACT: demand zone first touch")
+alertcondition(sigShort, "OB REACT Short", "OB REACT: supply zone first touch")

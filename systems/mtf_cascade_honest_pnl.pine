@@ -1,0 +1,215 @@
+//@version=6
+// ════════════════════════════════════════════════════════════════════════
+// QUANTUM FLOW v19-MTF — Cascade Entry + Honest P&L  (v1.0)
+// ------------------------------------------------------------------------
+// The idea (your model): a signal builds from LOW timeframe UP to HIGH.
+//   1m fires  →  3m confirms  →  5m confirms  →  15m confirms  →  ENTER.
+// A higher-TF bias never appears from nowhere; the lower TFs "ready" it first.
+// So we only take a trade when the whole ladder AGREES, and (optionally) only
+// when they turned in lower→higher ORDER (the true cascade).
+//
+// DESIGN CHOICES (deliberately the opposite of v19's 417 knobs):
+//   • ~12 inputs, one clean per-TF bias (EMA fast vs slow), no black boxes.
+//   • Run this on the LOWEST ladder timeframe (1m). Higher TFs are pulled with
+//     request.security(lookahead_off) — no repaint, no look-ahead.
+//   • P&L is conservative: ambiguous SL+TP bar = LOSS; commission+slippage out.
+//   • Built-in BETA detector: long-only vs short-only net + buy&hold benchmark,
+//     so "gold just drifted" cannot masquerade as edge.
+// ════════════════════════════════════════════════════════════════════════
+indicator("QF v19-MTF — Cascade Entry + Honest P&L v1.0", overlay=true, max_labels_count=300, max_lines_count=100)
+
+// ── ladder ──
+tf1   = input.timeframe("1",  "TF1 (lowest — run chart here)", group="Cascade")
+tf2   = input.timeframe("3",  "TF2", group="Cascade")
+tf3   = input.timeframe("5",  "TF3", group="Cascade")
+tf4   = input.timeframe("15", "TF4 (highest)", group="Cascade")
+nReq  = input.int(4, "TFs required to align", minval=2, maxval=4, group="Cascade")
+strict= input.bool(true, "Strict order (lower must flip first)", group="Cascade")
+
+emaFast = input.int(9,  "Bias EMA fast", minval=2, group="Signal")
+emaSlow = input.int(21, "Bias EMA slow", minval=3, group="Signal")
+
+atrMult = input.float(1.5, "Stop = ATR x", minval=0.3, group="Risk")
+rMult   = input.float(1.5, "Target (R multiple)", minval=0.3, group="Risk")
+maxHold = input.int(120, "Max bars in trade (else close)", minval=5, group="Risk")
+
+contracts = input.int(1,    "Contracts", minval=1, group="P&L")
+ptValue   = input.float(10.0,"$ per point (MGC=10, GC=100)", group="P&L")
+commSide  = input.float(0.74,"Commission $/side", group="P&L")
+slipPts   = input.float(0.1, "Slippage pts/side", group="P&L")
+
+// ── per-TF bias (1 = bull, -1 = bear); pulled from each ladder TF ──
+f_bias(_tf) =>
+    request.security(syminfo.tickerid, _tf, ta.ema(close, emaFast) > ta.ema(close, emaSlow) ? 1 : -1, lookahead=barmerge.lookahead_off)
+b1 = f_bias(tf1)
+b2 = f_bias(tf2)
+b3 = f_bias(tf3)
+b4 = f_bias(tf4)
+
+// flip bar_index per TF (when did each turn?) — for the ORDER test
+var int fb1 = na
+var int fb2 = na
+var int fb3 = na
+var int fb4 = na
+if b1 != b1[1]
+    fb1 := bar_index
+if b2 != b2[1]
+    fb2 := bar_index
+if b3 != b3[1]
+    fb3 := bar_index
+if b4 != b4[1]
+    fb4 := bar_index
+
+// alignment over the first nReq timeframes
+f_aligned(_dir) =>
+    ok = b1 == _dir and b2 == _dir
+    ok := ok and (nReq < 3 or b3 == _dir)
+    ok := ok and (nReq < 4 or b4 == _dir)
+    ok
+alignedLong  = f_aligned(1)
+alignedShort = f_aligned(-1)
+
+// order test: lower flipped no later than higher (earlier flip = smaller bar_index)
+f_ordered() =>
+    o = nz(fb1, -1) <= nz(fb2, -1)
+    o := o and (nReq < 3 or nz(fb2, -1) <= nz(fb3, -1))
+    o := o and (nReq < 4 or nz(fb3, -1) <= nz(fb4, -1))
+    o
+seqOK = not strict or f_ordered()
+
+// ── trade state ──
+var int   pos      = 0
+var float entry    = na
+var float stop     = na
+var float tgt      = na
+var int   entryBar = na
+atr = ta.atr(14)
+
+enterLong  = pos == 0 and alignedLong  and seqOK and not alignedLong[1]  and barstate.isconfirmed
+enterShort = pos == 0 and alignedShort and seqOK and not alignedShort[1] and barstate.isconfirmed
+
+if enterLong
+    pos := 1
+    entry := close
+    entryBar := bar_index
+    stop := close - atr * atrMult
+    tgt  := close + (close - stop) * rMult
+if enterShort
+    pos := -1
+    entry := close
+    entryBar := bar_index
+    stop := close + atr * atrMult
+    tgt  := close - (stop - close) * rMult
+
+// ── stats ──
+var int   nTr=0
+var int   nWin=0
+var float winD=0.0
+var float lossD=0.0
+var float netP=0.0
+var float sumWinR=0.0
+var float sumLossR=0.0
+var int   nLong=0
+var int   nLongWin=0
+var int   nShort=0
+var int   nShortWin=0
+var float longNet=0.0
+var float shortNet=0.0
+var float betaStart=na
+if na(betaStart)
+    betaStart := close
+
+// ── exit (conservative: SL first => ambiguous bar = loss) ──
+float exitPx = na
+if pos != 0 and bar_index > entryBar
+    force = (bar_index - entryBar) >= maxHold
+    if pos == 1
+        if low <= stop
+            exitPx := stop
+        else if high >= tgt
+            exitPx := tgt
+        else if force
+            exitPx := close
+    else
+        if high >= stop
+            exitPx := stop
+        else if low <= tgt
+            exitPx := tgt
+        else if force
+            exitPx := close
+
+if not na(exitPx)
+    pts   = pos == 1 ? (exitPx - entry) : (entry - exitPx)
+    gross = pts * ptValue * contracts
+    costs = (commSide * 2 + slipPts * ptValue * 2) * contracts
+    net   = gross - costs
+    risk  = math.abs(entry - stop)
+    rr    = risk > 0 ? pts / risk : 0.0
+    nTr += 1
+    netP += net
+    win = net > 0
+    if win
+        nWin += 1
+        winD += net
+        sumWinR += rr
+    else
+        lossD += math.abs(net)
+        sumLossR += math.abs(rr)
+    if pos == 1
+        nLong += 1
+        longNet += net
+        nLongWin += win ? 1 : 0
+    else
+        nShort += 1
+        shortNet += net
+        nShortWin += win ? 1 : 0
+    label.new(bar_index, exitPx, (win?"+":"")+"$"+str.tostring(net,"#.#"), style=pos==1?label.style_label_down:label.style_label_up, color=win?color.new(color.teal,25):color.new(color.red,25), textcolor=color.white, size=size.tiny)
+    pos := 0
+    entry := na
+    stop := na
+    tgt := na
+
+// ── entry markers + levels ──
+plotshape(enterLong,  "Long",  shape.triangleup,   location.belowbar, color.new(color.teal,0), size=size.small)
+plotshape(enterShort, "Short", shape.triangledown, location.abovebar, color.new(color.red,0),  size=size.small)
+plot(pos!=0 ? stop : na, "Stop", color.new(color.red,0),  1, plot.style_linebr)
+plot(pos!=0 ? tgt  : na, "Tgt",  color.new(color.teal,0), 1, plot.style_linebr)
+
+// ── beta + verdict ──
+betaNet  = not na(betaStart) ? (close - betaStart) * ptValue * contracts : 0.0
+wr       = nTr  > 0 ? nWin*100.0/nTr : 0.0
+lwr      = nLong > 0 ? nLongWin*100.0/nLong : 0.0
+swr      = nShort> 0 ? nShortWin*100.0/nShort : 0.0
+pf       = lossD > 0 ? winD/lossD : na
+expR     = nTr > 0 ? (sumWinR - sumLossR)/nTr : 0.0
+twoSided = longNet > 0 and shortNet > 0
+verdict  = nTr < 15 ? "NEED >15 TRADES" : twoSided ? "STRUCTURE (2-sided)" : (longNet>0 and shortNet<=0 and betaNet>0 ? "BETA RISK (longs only)" : longNet<=0 and shortNet>0 and betaNet<0 ? "BETA RISK (shorts only)" : netP>0 ? "MIXED" : "NO EDGE")
+vCol     = nTr < 15 ? color.gray : twoSided ? color.teal : netP>0 ? color.orange : color.red
+
+f_arrow(_b) => _b == 1 ? "▲" : _b == -1 ? "▼" : "–"
+
+// ── dashboard ──
+var table dash = table.new(position.bottom_right, 2, 15, border_width=1)
+f_row(i, k, v, c) =>
+    table.cell(dash, 0, i, k, text_color=color.white, bgcolor=color.new(color.gray,70), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, i, v, text_color=color.white, bgcolor=c, text_size=size.tiny, text_halign=text.align_right)
+if barstate.islast
+    f_row(0,  "MTF CASCADE", "Honest P&L", color.new(color.blue,40))
+    f_row(1,  "TF "+tf1, f_arrow(b1), b1==1?color.new(color.teal,45):color.new(color.red,45))
+    f_row(2,  "TF "+tf2, f_arrow(b2), b2==1?color.new(color.teal,45):color.new(color.red,45))
+    f_row(3,  "TF "+tf3+(nReq<3?" (off)":""), f_arrow(b3), b3==1?color.new(color.teal,45):color.new(color.red,45))
+    f_row(4,  "TF "+tf4+(nReq<4?" (off)":""), f_arrow(b4), b4==1?color.new(color.teal,45):color.new(color.red,45))
+    f_row(5,  "Cascade", alignedLong and seqOK?"LONG READY":alignedShort and seqOK?"SHORT READY":"— wait —", color.new(color.gray,55))
+    f_row(6,  "Trades / WR", str.tostring(nTr)+" / "+str.tostring(wr,"#")+"%", color.new(color.gray,60))
+    f_row(7,  "NET $ (a/comm)", (netP>=0?"+$":"-$")+str.tostring(math.abs(netP),"#"), netP>=0?color.new(color.teal,30):color.new(color.red,30))
+    f_row(8,  "Profit factor", na(pf)?"—":str.tostring(pf,"#.##"), color.new(color.gray,60))
+    f_row(9,  "Expectancy R", str.tostring(expR,"#.##")+"R", expR>=0?color.new(color.teal,40):color.new(color.red,40))
+    f_row(10, "LONG n/WR/net", str.tostring(nLong)+"/"+str.tostring(lwr,"#")+"%/"+(longNet>=0?"+":"")+str.tostring(longNet,"#"), longNet>=0?color.new(color.teal,50):color.new(color.red,50))
+    f_row(11, "SHORT n/WR/net", str.tostring(nShort)+"/"+str.tostring(swr,"#")+"%/"+(shortNet>=0?"+":"")+str.tostring(shortNet,"#"), shortNet>=0?color.new(color.teal,50):color.new(color.red,50))
+    f_row(12, "Buy&hold (beta)", (betaNet>=0?"+$":"-$")+str.tostring(math.abs(betaNet),"#"), color.new(color.purple,40))
+    f_row(13, "Pos now", pos==1?"LONG":pos==-1?"SHORT":"flat", color.new(color.gray,65))
+    f_row(14, "VERDICT", verdict, color.new(vCol,20))
+
+// ── alerts ──
+alertcondition(enterLong,  "Cascade LONG",  "MTF cascade LONG confirmed")
+alertcondition(enterShort, "Cascade SHORT", "MTF cascade SHORT confirmed")
